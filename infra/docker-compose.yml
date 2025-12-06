@@ -1,0 +1,36 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7
+    container_name: tracker-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: tracker-backend
+    restart: always
+    depends_on:
+      - redis
+    environment:
+      REDIS_URL: "redis://redis:6379/0"
+      WEBHOOK_SECRET: "${WEBHOOK_SECRET}"
+      DEVICE_UPLOAD_TOKEN: "${DEVICE_UPLOAD_TOKEN}"
+      AUDIO_DIR: "/data/audio"
+      FRONTEND_ORIGIN: "http://localhost:3000"
+      TOKEN_TTL_SECONDS: 900
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../backend:/app
+      - backend_audio:/data/audio
+
+volumes:
+  redisdata:
+  backend_audio:
