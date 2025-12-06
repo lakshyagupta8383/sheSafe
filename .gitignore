@@ -1,0 +1,114 @@
+########################################
+# GLOBAL IGNORES
+########################################
+*.swp
+*.tmp
+*.log
+*.pid
+*.DS_Store
+Thumbs.db
+*.orig
+
+########################################
+# ENVIRONMENT FILES (IMPORTANT)
+########################################
+.env
+.env.*
+!/infra/.env.example
+!/backend/.env.example
+!/gateway/.env.example
+
+########################################
+# PYTHON / FASTAPI BACKEND
+########################################
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Python build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Local audio files (uploaded)
+backend/audio/
+data/audio/
+
+########################################
+# REDIS & DB FILES
+########################################
+dump.rdb
+*.rdb
+*.aof
+
+########################################
+# NEXT.JS FRONTEND
+########################################
+node_modules/
+.next/
+out/
+.next/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-store/
+
+# Local environment
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+
+########################################
+# DEVICE / ESP32
+########################################
+device/build/
+device/.pio/
+*.bin
+*.elf
+*.hex
+
+########################################
+# DOCKER & COMPOSE
+########################################
+docker-compose.override.yml
+docker/*.log
+*.tar
+*.img
+
+########################################
+# EDITOR IGNORE
+########################################
+# VSCode
+.vscode/
+.history/
+
+# JetBrains
+.idea/
+*.iml/
+
+# Mac & Linux
+*.swp
+.cache/
+
+########################################
+# TESTS / COVERAGE
+########################################
+coverage/
+.coverage
+pytest_cache/
+
+########################################
+# GATEWAY
+########################################
+gateway/__pycache__/
+gateway/*.pyc
+gateway/*.log
