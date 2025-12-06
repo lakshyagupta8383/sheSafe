@@ -107,6 +107,16 @@ async def get_location(device: str):
                             lon=float(rec["lon"]),
                             timestamp=rec["timestamp"],
                             status=rec.get("status", "active"))
+@app.get("/api/resolve-token")
+async def resolve_token(token: str):
+    """
+    Map token -> device. Frontend calls this when landing on /track?token=...
+    """
+    device = r.get(token_key(token))
+    if not device:
+        return JSONResponse(status_code=404, content={"ok": False, "reason": "token not found"})
+    latest = get_latest(device) or {}
+    return {"ok": True, "device": device, "latest": latest}
 
 @app.post("/api/mark-safe")
 async def mark_safe(req: MarkSafeRequest):
