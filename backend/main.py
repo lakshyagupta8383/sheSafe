@@ -23,7 +23,16 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "supersecret")  # gateway sign
 TOKEN_TTL_SECONDS = int(os.environ.get("TOKEN_TTL_SECONDS", "900"))  # 15 minutes default
 
 app = FastAPI(title="Tracker Webhook API")
+pathlib.Path(AUDIO_DIR).mkdir(parents=True, exist_ok=True)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[FRONTEND_ORIGIN],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
+app.mount("/static/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 redis = RedisClient.from_url(REDIS_URL)
 
 class WebhookPayload(BaseModel):
@@ -39,40 +48,54 @@ class MarkSafeRequest(BaseModel):
 
 class LocationResponse(BaseModel):
     device: str
-    lat: float
-    lon: float
-    timestamp: str
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    timestamp: Optional[str] = None
     status: str
+    audio_url: Optional[str] = None
+    audio_ts: Optional[str] = None  
+
+RE_TOKEN = re.compile(r"[?&]token=([A-Za-z0-9_\-]+)")
 
 @app.post("/api/webhook/sms")
-async def webhook_sms(payload: WebhookPayload, request: Request,
-                      x_provider_signature: Optional[str] = Header(None),
-                      x_webhook_token: Optional[str] = Header(None)):
+async def webhook_sms(request: Request, x_webhook_token: Optional[str] = Header(None)):
     """
-    Webhook endpoint for SMS gateway. Accepts JSON with device, lat, lon.
-    Gateway should post JSON. Validate either signature or header token.
+    Gateway posts JSON:
+    { "from": "+9199..", "raw_sms": "https://.../track?token=abc", "timestamp": "..." }
+    We verify X-Webhook-Token, extract token, map to device, and mark device active.
     """
-    body_bytes = await request.body()
-    # verify signature or token (supports either)
-    if not verify_signature_or_token(body=body_bytes,
-                                     header_sig=x_provider_signature,
-                                     header_token=x_webhook_token,
-                                     secret=WEBHOOK_SECRET):
-        raise HTTPException(status_code=401, detail="invalid signature/token")
+    if x_webhook_token != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="invalid webhook token")
 
-    # parse timestamp
-    ts = payload.timestamp or datetime.now(timezone.utc).isoformat()
-    # upsert latest state
-    latest = {
-        "lat": float(payload.lat),
-        "lon": float(payload.lon),
+    payload = await request.json()
+    raw_sms = payload.get("raw_sms") or payload.get("text") or ""
+    sender = payload.get("from")
+    ts = payload.get("timestamp") or now_iso()
+
+    m = RE_TOKEN.search(raw_sms)
+    if not m:
+        r.lpush("unmapped:links", json.dumps({"raw": raw_sms, "from": sender, "ts": ts}))
+        return {"ok": False, "reason": "no token in SMS"}
+
+    token = m.group(1)
+    device = r.get(token_key(token))
+    if not device:
+        r.lpush("unmapped:links", json.dumps({"raw": raw_sms, "from": sender, "ts": ts, "token": token}))
+        return {"ok": False, "reason": "unknown token"}
+
+    # mark device active; preserve any existing lat/lon
+    latest = get_latest(device) or {}
+    latest.update({
+        "lat": latest.get("lat"),
+        "lon": latest.get("lon"),
         "timestamp": ts,
         "status": "active",
-    }
-    redis.set_latest(payload.device, latest)
-    # append to history (capped list)
-    redis.push_history(payload.device, latest)
-    return {"ok": True}
+        "last_sms": raw_sms,
+        "sender": sender
+    })
+    set_latest(device, latest)
+    push_history(device, {"event": "sos_via_link", "ts": ts, "sender": sender})
+    return {"ok": True, "device": device}
 
 @app.get("/api/location", response_model=LocationResponse)
 async def get_location(device: str):
