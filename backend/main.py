@@ -7,10 +7,17 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 from datetime import datetime, timezone
 import json
-
 from db import RedisClient
 from verify import verify_signature_or_token
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi import UploadFile, File, Form
+import pathlib
+import secrets
 
+DEVICE_UPLOAD_TOKEN = os.getenv("DEVICE_UPLOAD_TOKEN", "devtoken")  # header token devices use to upload audio
+AUDIO_DIR = os.getenv("AUDIO_DIR", "/data/audio")                  # where audio files are stored (dev)
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "supersecret")  # gateway signing secret or shared token
 TOKEN_TTL_SECONDS = int(os.environ.get("TOKEN_TTL_SECONDS", "900"))  # 15 minutes default
