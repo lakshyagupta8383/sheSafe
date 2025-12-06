@@ -1,29 +1,34 @@
-# backend/main.py
 import os
-import hmac
-import hashlib
 from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import UploadFile, File, Form
 from pydantic import BaseModel
 from datetime import datetime, timezone
 import json
 from db import RedisClient
-from verify import verify_signature_or_token
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi import UploadFile, File, Form
 import pathlib
 import secrets
+import re
+from fastapi.responses import JSONResponse
 
-DEVICE_UPLOAD_TOKEN = os.getenv("DEVICE_UPLOAD_TOKEN", "devtoken")  # header token devices use to upload audio
-AUDIO_DIR = os.getenv("AUDIO_DIR", "/data/audio")                  # where audio files are stored (dev)
+# -------------------------
+# Config
+# -------------------------
+DEVICE_UPLOAD_TOKEN = os.getenv("DEVICE_UPLOAD_TOKEN", "devtoken")
+AUDIO_DIR = os.getenv("AUDIO_DIR", "/data/audio")
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "supersecret")  # gateway signing secret or shared token
-TOKEN_TTL_SECONDS = int(os.environ.get("TOKEN_TTL_SECONDS", "900"))  # 15 minutes default
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "supersecret")
+TOKEN_TTL_SECONDS = int(os.environ.get("TOKEN_TTL_SECONDS", "900"))
 
+# -------------------------
+# App & storage setup
+# -------------------------
 app = FastAPI(title="Tracker Webhook API")
 pathlib.Path(AUDIO_DIR).mkdir(parents=True, exist_ok=True)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[FRONTEND_ORIGIN],
@@ -32,16 +37,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# serve audio files (dev only)
 app.mount("/static/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
+
 redis = RedisClient.from_url(REDIS_URL)
 
-class WebhookPayload(BaseModel):
-    device: str
-    lat: float
-    lon: float
-    timestamp: Optional[str] = None
-    raw_sms: Optional[str] = None
-
+# -------------------------
+# Models
+# -------------------------
 class MarkSafeRequest(BaseModel):
     device: str
     auth_token: Optional[str] = None
@@ -53,38 +56,52 @@ class LocationResponse(BaseModel):
     timestamp: Optional[str] = None
     status: str
     audio_url: Optional[str] = None
-    audio_ts: Optional[str] = None  
+    audio_ts: Optional[str] = None
 
+# -------------------------
+# Helpers
+# -------------------------
 RE_TOKEN = re.compile(r"[?&]token=([A-Za-z0-9_\-]+)")
 
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+# -------------------------
+# Webhook: gateway → backend
+# -------------------------
 @app.post("/api/webhook/sms")
 async def webhook_sms(request: Request, x_webhook_token: Optional[str] = Header(None)):
     """
     Gateway posts JSON:
     { "from": "+9199..", "raw_sms": "https://.../track?token=abc", "timestamp": "..." }
-    We verify X-Webhook-Token, extract token, map to device, and mark device active.
+    Verifies gateway secret, extracts token, maps token→device, marks device active.
     """
     if x_webhook_token != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="invalid webhook token")
 
     payload = await request.json()
-    raw_sms = payload.get("raw_sms") or payload.get("text") or ""
+    raw_sms = payload.get("raw_sms") or payload.get("text") or payload.get("body") or ""
     sender = payload.get("from")
     ts = payload.get("timestamp") or now_iso()
 
     m = RE_TOKEN.search(raw_sms)
     if not m:
-        r.lpush("unmapped:links", json.dumps({"raw": raw_sms, "from": sender, "ts": ts}))
+        redis.r.lpush("unmapped:links", json.dumps({"raw": raw_sms, "from": sender, "ts": ts}))
         return {"ok": False, "reason": "no token in SMS"}
 
     token = m.group(1)
-    device = r.get(token_key(token))
+
+    try:
+        device = redis.r.get(redis.token_key(token))
+    except Exception:
+        device = None
+
     if not device:
-        r.lpush("unmapped:links", json.dumps({"raw": raw_sms, "from": sender, "ts": ts, "token": token}))
+        redis.r.lpush("unmapped:links",
+                      json.dumps({"raw": raw_sms, "from": sender, "ts": ts, "token": token}))
         return {"ok": False, "reason": "unknown token"}
 
-    # mark device active; preserve any existing lat/lon
-    latest = get_latest(device) or {}
+    latest = redis.get_latest(device) or {}
     latest.update({
         "lat": latest.get("lat"),
         "lon": latest.get("lon"),
@@ -93,50 +110,81 @@ async def webhook_sms(request: Request, x_webhook_token: Optional[str] = Header(
         "last_sms": raw_sms,
         "sender": sender
     })
-    set_latest(device, latest)
-    push_history(device, {"event": "sos_via_link", "ts": ts, "sender": sender})
+    redis.set_latest(device, latest)
+    redis.push_history(device, {"event": "sos_via_link", "ts": ts, "sender": sender})
+
     return {"ok": True, "device": device}
 
+# -------------------------
+# Location API (frontend)
+# -------------------------
 @app.get("/api/location", response_model=LocationResponse)
 async def get_location(device: str):
     rec = redis.get_latest(device)
     if not rec:
         raise HTTPException(status_code=404, detail="device not found")
-    return LocationResponse(device=device,
-                            lat=float(rec["lat"]),
-                            lon=float(rec["lon"]),
-                            timestamp=rec["timestamp"],
-                            status=rec.get("status", "active"))
+
+    lat = float(rec["lat"]) if rec.get("lat") is not None else None
+    lon = float(rec["lon"]) if rec.get("lon") is not None else None
+
+    return LocationResponse(
+        device=device,
+        lat=lat,
+        lon=lon,
+        timestamp=rec.get("timestamp"),
+        status=rec.get("status", "active"),
+        audio_url=rec.get("audio_url"),
+        audio_ts=rec.get("audio_ts")
+    )
+
+# -------------------------
+# Token resolution (frontend)
+# -------------------------
 @app.get("/api/resolve-token")
 async def resolve_token(token: str):
-    """
-    Map token -> device. Frontend calls this when landing on /track?token=...
-    """
-    device = r.get(token_key(token))
+    device = redis.r.get(redis.token_key(token))
     if not device:
         return JSONResponse(status_code=404, content={"ok": False, "reason": "token not found"})
-    latest = get_latest(device) or {}
+
+    latest = redis.get_latest(device) or {}
     return {"ok": True, "device": device, "latest": latest}
 
+# -------------------------
+# Mark device safe
+# -------------------------
 @app.post("/api/mark-safe")
 async def mark_safe(req: MarkSafeRequest):
     rec = redis.get_latest(req.device)
     if not rec:
         raise HTTPException(status_code=404, detail="device not found")
-    # if token present, validate it maps to device
+
     if req.auth_token:
         mapped = redis.consume_token(req.auth_token)
         if mapped != req.device:
             raise HTTPException(status_code=401, detail="invalid auth token")
-    # mark safe and update timestamp
+
     rec["status"] = "safe"
-    rec["timestamp"] = datetime.now(timezone.utc).isoformat()
+    rec["timestamp"] = now_iso()
     redis.set_latest(req.device, rec)
-    redis.push_history(req.device, rec)
+    redis.push_history(req.device, {"event": "marked_safe", "ts": rec["timestamp"]})
+
     return {"ok": True, "status": "safe"}
 
-# Dev helper: generate short link token
+# -------------------------
+# Token generation (dev / gateway)
+# -------------------------
 @app.post("/api/token/generate")
 async def gen_token(device: str):
     token = redis.create_token(device, ttl=TOKEN_TTL_SECONDS)
     return {"token": token, "ttl_seconds": TOKEN_TTL_SECONDS}
+
+# -------------------------
+# Health
+# -------------------------
+@app.get("/health")
+async def health():
+    try:
+        redis.r.ping()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
