@@ -8,10 +8,12 @@ import json
 from db import RedisClient
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-import pathlib
+from pathlib import Path
 import secrets
 import re
 from fastapi.responses import JSONResponse
+import aiofiles
+from fastapi import Query
 
 # -------------------------
 # Config
@@ -27,7 +29,8 @@ TOKEN_TTL_SECONDS = int(os.environ.get("TOKEN_TTL_SECONDS", "900"))
 # App & storage setup
 # -------------------------
 app = FastAPI(title="Tracker Webhook API")
-pathlib.Path(AUDIO_DIR).mkdir(parents=True, exist_ok=True)
+# Use Path (we imported it) instead of undefined 'pathlib'
+Path(AUDIO_DIR).mkdir(parents=True, exist_ok=True)
 
 app.add_middleware(
     CORSMiddleware,
@@ -188,3 +191,81 @@ async def health():
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+#--------------------------
+#Location and audio file 
+#writing on the db
+#--------------------------
+
+def _safe_filename(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+
+@app.post("/api/upload")
+async def upload_with_location(
+    device: str = Form(...),
+    lat: Optional[float] = Form(None),
+    lon: Optional[float] = Form(None),
+    timestamp: Optional[str] = Form(None),
+    file: UploadFile = File(None),
+    x_device_token: Optional[str] = Header(None),
+):
+    """
+    Accepts multipart/form-data fields:
+      - device (str)
+      - lat (float, optional)
+      - lon (float, optional)
+      - timestamp (ISO string, optional) -- gateway-supplied time
+      - file (audio blob, optional)
+    Must include header: X-Device-Token: <DEVICE_UPLOAD_TOKEN>
+    """
+
+    # auth
+    if x_device_token != DEVICE_UPLOAD_TOKEN:
+        raise HTTPException(status_code=401, detail="invalid device upload token")
+
+    ts = timestamp or now_iso()
+
+    # prepare latest record base
+    latest = redis.get_latest(device) or {}
+    latest["timestamp"] = ts
+    latest["status"] = latest.get("status", "active")
+
+    # update lat/lon if provided
+    if lat is not None and lon is not None:
+        latest["lat"] = float(lat)
+        latest["lon"] = float(lon)
+        redis.push_history(device, {"event": "location_update", "ts": ts, "lat": float(lat), "lon": float(lon)})
+
+    audio_rel = None
+    if file:
+        # handle file (save to disk)
+        filename_raw = file.filename or "audio"
+        ext = Path(filename_raw).suffix or ".webm"
+        ext = ext.lower()
+        if ext not in (".webm", ".wav", ".mp3", ".ogg", ".m4a"):
+            ext = ".webm"
+
+        unique = secrets.token_urlsafe(8)
+        out_name = f"{_safe_filename(device)}_{unique}{ext}"
+        out_path = Path(AUDIO_DIR) / out_name
+
+        try:
+            async with aiofiles.open(out_path, "wb") as f:
+                contents = await file.read()
+                await f.write(contents)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"failed to save file: {e}")
+
+        audio_rel = f"/static/audio/{out_name}"
+        latest["audio_url"] = audio_rel
+        latest["audio_ts"] = ts
+        redis.push_history(device, {"event": "audio_upload", "ts": ts, "path": audio_rel})
+
+    # persist combined latest
+    redis.set_latest(device, latest)
+
+    resp = {"ok": True, "device": device, "timestamp": ts}
+    if audio_rel:
+        resp["audio_url"] = audio_rel
+        resp["audio_ts"] = ts
+    return resp
